@@ -12,12 +12,14 @@ concurrency:
 
 jobs:
   release-static:
-    name: "Static build PG${{ matrix.pg }} ${{ matrix.arch }}"
+    name: "PG${{ matrix.pg }} ${{ matrix.arch }}"
     strategy:
       fail-fast: false
       matrix:
-        pg: [14, 15, 16, 17, 18]
-        arch: [x86_64, aarch64]
+        #pg: [14, 15, 16, 17, 18]
+        pg: [17]
+        #arch: [x86_64, aarch64]
+        arch: [x86_64]
         include:
         - arch: x86_64
           runner: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-24.04' }}
