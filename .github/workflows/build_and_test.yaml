@@ -1,7 +1,8 @@
 name: CI
 on:
   push:
-    branches: ["main"]
+    # TODO
+    branches: ["main", "test"]
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
