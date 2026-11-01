@@ -1,6 +1,7 @@
 name: Release
 on:
   push:
+    # TODO
     branches: ["main", "test"]
     tags: ["v*"]
   workflow_dispatch:
@@ -12,19 +13,17 @@ concurrency:
 
 jobs:
   release-static:
-    name: "PG${{ matrix.pg }} ${{ matrix.arch }}"
+    name: "pg${{ matrix.pg }} ${{ matrix.arch }}"
     strategy:
       fail-fast: false
       matrix:
-        #pg: [14, 15, 16, 17, 18]
-        pg: [17]
-        #arch: [x86_64, aarch64]
-        arch: [x86_64]
+        pg: [14, 15, 16, 17, 18]
+        arch: [x86_64, aarch64]
         include:
         - arch: x86_64
           runner: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-x64' || 'ubuntu-24.04' }}
-        #- arch: aarch64
-        #  runner: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-arm64' || 'ubuntu-24.04-arm' }}
+        - arch: aarch64
+          runner: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-arm64' || 'ubuntu-24.04-arm' }}
 
     runs-on: ${{ matrix.runner }}
 
@@ -211,7 +210,7 @@ jobs:
           EOF
 
       - name: Upload package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: ${{ env.PACKAGE_NAME }}
           path: package/${{ env.PACKAGE_NAME }}.tar.gz
@@ -219,3 +218,49 @@ jobs:
       - name: Stop build container
         if: always()
         run: docker rm -f "$CONTAINER" || true
+
+  # A separate job after all the builds, so that a single draft gets all the packages. Draft releases are not tied to
+  # their tag until published, so builds creating the draft in parallel could create several.
+  release:
+    name: "Create release draft"
+    needs: release-static
+    if: github.repository_owner == 'duckdb' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ github.repository_owner == 'duckdb' && 'namespace-profile-linux-slim' || 'ubuntu-24.04' }}
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TAG: ${{ github.ref_name }}
+
+    steps:
+      - name: Check release tag
+        id: tag
+        run: |
+          if [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "$TAG is not a vX.Y.Z tag, not creating a release"
+          fi
+
+      - name: Download packages
+        if: steps.tag.outputs.release == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          pattern: pg_duckdb-pg*-linux-*
+          path: package
+          merge-multiple: true
+
+      - name: Create release draft
+        if: steps.tag.outputs.release == 'true'
+        working-directory: package
+        run: |
+          ls -l
+          sha256sum pg_duckdb-*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+          # A rerun adds the packages to the draft that the first run created
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$TAG" pg_duckdb-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$TAG" pg_duckdb-*.tar.gz SHA256SUMS --repo "$GITHUB_REPOSITORY" \
+              --draft --verify-tag --title "pg_duckdb $TAG" --generate-notes
+          fi
