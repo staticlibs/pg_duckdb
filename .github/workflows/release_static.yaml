@@ -46,17 +46,18 @@ jobs:
 
       # The DuckDB build does not depend on the Postgres version, and includes the libraries vcpkg built. The
       # Makefile sets the DuckDB version, the extensions config the extensions that are built.
-      - name: Setup DuckDB build cache
-        uses: actions/cache@v6
+      - name: Restore DuckDB build cache
+        id: duckdb-cache
+        uses: actions/cache/restore@v6
         with:
           path: third_party/duckdb/build/
           key: release-static-duckdb-build-${{ matrix.arch }}-${{ hashFiles('Makefile', 'third_party/pg_duckdb_extensions.cmake') }}-ninja
 
-      - name: Setup ccache cache
-        uses: actions/cache@v6
+      - name: Restore ccache cache
+        uses: actions/cache/restore@v6
         with:
           path: .ccache/
-          key: release-static-ccache-${{ matrix.arch }}-pg${{ matrix.pg }}-${{ github.run_id }}
+          key: release-static-ccache-${{ matrix.arch }}-pg${{ matrix.pg }}-${{ github.run_id }}-${{ github.run_attempt }}
           restore-keys: |
             release-static-ccache-${{ matrix.arch }}-pg${{ matrix.pg }}-
             release-static-ccache-${{ matrix.arch }}-
@@ -105,6 +106,7 @@ jobs:
           EOF
 
       - name: Build pg_duckdb extension
+        id: build
         run: |
           docker exec -i "$CONTAINER" bash -s <<'EOF'
           set -euxo pipefail
@@ -116,6 +118,22 @@ jobs:
             VCPKG_TOOLCHAIN_PATH=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake
           ccache --show-stats
           EOF
+
+      # Saved right after the build, so that a rerun after a failing later step is fast. The ccache is also saved
+      # when the build fails, the DuckDB build directory only when it is complete.
+      - name: Save ccache cache
+        if: always() && steps.build.outcome != 'skipped'
+        uses: actions/cache/save@v6
+        with:
+          path: .ccache/
+          key: release-static-ccache-${{ matrix.arch }}-pg${{ matrix.pg }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Save DuckDB build cache
+        if: steps.build.outcome == 'success' && steps.duckdb-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: third_party/duckdb/build/
+          key: release-static-duckdb-build-${{ matrix.arch }}-${{ hashFiles('Makefile', 'third_party/pg_duckdb_extensions.cmake') }}-ninja
 
       - name: Check binary dependencies
         run: |
@@ -134,21 +152,25 @@ jobs:
           EOF
 
       - name: Run smoke test
-        id: smoke
         run: |
           docker exec -i "$CONTAINER" bash -s <<'EOF'
           set -euxo pipefail
           PGBIN="/usr/pgsql-${PG_MAJOR}/bin"
+          # Show the server log next to whatever failed
+          trap 'echo "=== postgres.log"; cat /home/pgtest/postgres.log || true' ERR
           useradd --create-home pgtest
           runuser -u pgtest -- "$PGBIN/initdb" -D /home/pgtest/data -A trust -E UTF8 --no-locale
           cat >> /home/pgtest/data/postgresql.conf <<'CONF'
+          # PGDG's default socket directory /var/run/postgresql is created by systemd, which the container does not run
+          unix_socket_directories = '/tmp'
+          listen_addresses = ''
           shared_preload_libraries = 'pg_duckdb'
           # Fail instead of downloading DuckDB extensions, the smoke test only uses what is built in
           duckdb.autoinstall_known_extensions = false
           CONF
           runuser -u pgtest -- "$PGBIN/pg_ctl" -D /home/pgtest/data -l /home/pgtest/postgres.log -w start
 
-          runuser -u pgtest -- "$PGBIN/psql" -X -q -At -v ON_ERROR_STOP=1 -d postgres > /tmp/smoke.out <<'SQL'
+          runuser -u pgtest -- "$PGBIN/psql" -X -q -At -v ON_ERROR_STOP=1 -h /tmp -d postgres > /tmp/smoke.out <<'SQL'
           CREATE EXTENSION pg_duckdb;
           CREATE TABLE t AS SELECT g AS id, md5(g::text) AS v FROM generate_series(1, 1000) g;
           CREATE TABLE toast_lz4 (v text COMPRESSION lz4);
@@ -173,10 +195,6 @@ jobs:
 
           runuser -u pgtest -- "$PGBIN/pg_ctl" -D /home/pgtest/data -w stop
           EOF
-
-      - name: Print postgres.log if smoke test failed
-        if: failure() && steps.smoke.outcome == 'failure'
-        run: docker exec "$CONTAINER" cat /home/pgtest/postgres.log
 
       - name: Package pg_duckdb extension
         run: |
